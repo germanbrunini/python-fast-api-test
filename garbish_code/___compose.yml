@@ -1,0 +1,56 @@
+version: "3.9"  # Specifies the version of the Docker Compose file format to use
+
+services:
+  web:  # Defines a service named 'web' for your FastAPI application
+    # The 'build' section tells Docker Compose how to build the Docker image for this service
+    build:
+      context: .  # The build context; Docker will use files from the current directory (your project root)
+      dockerfile: Dockerfile  # Specifies the Dockerfile to use; here it's 'Dockerfile' in the current directory
+      # If your Dockerfile has a different name or is in a different directory, adjust this accordingly
+    # The 'ports' section maps ports between the host and the container
+    ports:
+      - "8000:8000"  # Maps port 8000 on the host to port 8000 in the container
+        # This allows you to access your FastAPI app via 'http://localhost:8000' on your host machine
+    # The 'volumes' section mounts host directories into the container
+    volumes:
+      - type: bind  # Specifies a bind mount; this binds a directory on the host to a directory in the container
+        source: .  # The source directory on the host; '.' refers to the current directory (your project root)
+        target: /app  # The target directory inside the container where the source directory will be mounted
+        # This setup allows you to edit code on your host machine and have the changes reflected inside the container
+        # Useful for development as you don't need to rebuild the image every time you make code changes
+        # Note: Excluding certain directories can prevent issues and improve performance
+        # Consider using a .dockerignore file to exclude files from the build context
+    # The 'environment' section sets environment variables inside the container
+    environment:
+      # Define any environment variables your application needs here
+      # For example:
+      # - ENV_VAR_NAME=value
+      # These can be accessed within your application code via os.environ.get('ENV_VAR_NAME')
+    # The 'command' section overrides the default command specified in the Dockerfile
+    command: ["fastapi", "dev", "--host", "0.0.0.0", "--app", "src.main:app"]
+      # This command runs the FastAPI application using the 'fastapi' CLI tool
+      # 'fastapi dev' starts the development server with auto-reload capabilities
+      # '--host 0.0.0.0' makes the server accessible from outside the container
+      # '--app src.main:app' specifies the application module and the ASGI application instance
+    # The 'restart' policy defines under what conditions Docker should restart the container
+    restart: unless-stopped  # The container will always restart unless it is explicitly stopped or Docker itself is stopped
+      # This is useful for keeping your application running during development
+    # The 'develop' section provides development-specific configurations like file watching for live reloading
+    develop:
+      watch:
+        # The 'watch' section defines actions to perform when files change on the host
+        - action: sync  # Synchronizes changes from the host to the container in real-time
+          path: .  # The path on the host to watch; '.' refers to the current directory (project root)
+          target: /app  # The target directory in the container where files will be synchronized
+          # This ensures that any changes you make to your code are immediately reflected inside the container
+          # The 'ignore' list specifies files and directories to exclude from synchronization
+          ignore:
+            - .venv/        # Excludes the virtual environment directory to prevent conflicts with the container's environment
+            - __pycache__/  # Excludes Python bytecode cache directories; they are platform-specific and unnecessary to sync
+            - .git/         # Excludes Git metadata; not needed inside the container and can be large
+            - dist/         # Excludes distribution/build artifacts
+            - build/        # Excludes build artifacts
+        - action: rebuild  # Rebuilds the Docker image when certain files change
+          path: ./pyproject.toml  # Watches 'pyproject.toml'; when it changes, the image will be rebuilt
+          # Rebuilding is necessary when dependencies change to ensure they are installed in the container
+          # This allows you to add new dependencies and have them reflected in your container environment automatically

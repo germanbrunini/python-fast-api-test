@@ -4,9 +4,9 @@ app = FastAPI()
 
 
 def hello():
-    print("Hello world")
+    print("Hello world!!")
 
 
 @app.get("/")
-async def root():
-    return "Hello world"
+def main():
+    return "Hello world!!!"
