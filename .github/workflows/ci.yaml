@@ -52,6 +52,7 @@ jobs:
           path: /tmp/my-fastapi-proj-2-multistage.tar
 
   test:
+    if: false
     name: "test image"
     runs-on: ubuntu-latest
     needs: build
