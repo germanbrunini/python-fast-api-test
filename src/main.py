@@ -14,4 +14,4 @@ async def read_route():
 
 @app.get("/greet/{name}")
 async def greet_name(name: str) -> dict:
-    return {"message": f"Hello {name}!!!"}
+    return {"message": f"Helllo {name}!!!"}
