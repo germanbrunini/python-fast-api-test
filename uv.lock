@@ -267,6 +267,7 @@ source = { editable = "." }
 dependencies = [
     { name = "fastapi", extra = ["standard"] },
     { name = "fastapi-cli" },
+    { name = "pydantic" },
     { name = "pytest" },
     { name = "typing" },
     { name = "uvicorn" },
@@ -282,6 +283,7 @@ dev = [
 requires-dist = [
     { name = "fastapi", extras = ["standard"], specifier = ">=0.112.2" },
     { name = "fastapi-cli", specifier = ">=0.0.5" },
+    { name = "pydantic", specifier = ">=2.8.2" },
     { name = "pytest", specifier = ">=8.3.3" },
     { name = "typing", specifier = ">=3.10.0.0" },
     { name = "uvicorn", specifier = ">=0.30.6" },
