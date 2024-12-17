@@ -1,8 +1,13 @@
-from random import randrange
-from typing import Optional
-
 from fastapi import FastAPI, Response, HTTPException, status
-from pydantic import BaseModel
+from random import randrange
+from typing import List, Optional
+import psycopg
+from psycopg.rows import dict_row  # Import the row factory for dictionaries
+from psycopg.pool import AsyncConnectionPool
+from pydantic import BaseModel, field_validator
+import time
+import asyncio
+
 
 # Detailed description of the API using Markdown
 description = """
@@ -37,12 +42,86 @@ app = FastAPI(
     },
 )
 
+# --------- Configuration ---------
+HOST = 'localhost'
+PT = '5433'
+DBN = 'postgres'
+USER = 'postgres'
+PASS = 'germanpostgres1'
 
+
+# Define your connection parameters
+DB_CONFIG = f'host={HOST} port={PT} dbname={DBN} user={USER} password={PASS}'
+
+# Retry connection until successful
+while True:
+    try:
+        with psycopg.connect(
+            DB_CONFIG, row_factory=dict_row
+        ) as conn:  # Use dict_row factory
+            print('Connection successful')
+
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    'SELECT id, title, content, published FROM public.posts ORDER BY id ASC;'
+                )
+                rows = cursor.fetchall()
+
+                # Each row is now a dictionary
+                for row in rows:
+                    print(
+                        f"ID: {row['id']}, Title: {row['title']}, Published: {row['published']}"
+                    )
+                    print(f"Content: {row['content']}\n")
+
+            break  # Exit the loop if connection and query are successful
+
+    except psycopg.OperationalError as e:
+        print(f'Operational error occurred: {e}')
+        time.sleep(5)  # Wait for 5 seconds before retrying
+
+    except Exception as e:
+        print(f'An unexpected error occurred: {e}')
+        break  # If it's a critical error, you may want to stop retrying
+
+
+# --------- Pydantic Models ---------
 class Post(BaseModel):
+    # id: int
+    title: str
+    content: str
+    published: bool = True
+
+    # rating: Optional[int] = None
+    # @field_validator('rating')
+    # def validate_rating(cls, value):
+    #    """
+    #    Ensure that the rating is between 1 and 5 if provided.
+    #
+    #    Args:
+    #        value (Optional[int]): The rating value to validate.
+    #
+    #    Returns:
+    #        Optional[int]: The validated rating.
+    #
+    #    Raises:
+    #        ValueError: If the rating is not between 1 and 5.
+    #    """
+    #    if value is not None:
+    #        if not (1 <= value <= 5):
+    #            raise ValueError('Rating must be between 1 and 5.')
+    #    return value
+
+
+class PostCreate(BaseModel):
     title: str
     content: str
     publish: bool = True
-    rating: Optional[int] = None
+
+
+# Response model for /posts endpoint
+class PostsResponse(BaseModel):
+    data: List[Post]
 
 
 my_post = [
@@ -260,4 +339,51 @@ async def delete_post(id: int):
     return {
         'message': f'Post with id {id} has been deleted successfully.',
         'deleted_post': deleted_post,
+    }
+
+
+@app.put('/posts/{id}')
+async def update_post(id: int, updated_post: Post):
+    """
+    Update an existing post by its ID.
+
+    Searches for a post with the given ID. If found, updates its details with the provided data.
+    If not found, raises a 404 HTTP exception.
+
+    Args:
+        id (int): The unique identifier of the post to update.
+        updated_post (Post): A Pydantic model instance containing the updated post details.
+
+    Returns:
+        dict: A confirmation message along with the updated post data.
+            Example:
+                {
+                    "message": "Post with id 1 has been updated successfully.",
+                    "updated_post": {
+                        "id": 1,
+                        "title": "Updated First Post",
+                        "content": "Updated content of the first post.",
+                        "publish": True,
+                        "rating": 4
+                    }
+                }
+
+    Raises:
+        HTTPException: If no post with the specified ID is found.
+            - status_code: 404 NOT FOUND
+            - detail: Error message indicating the missing post.
+    """
+    index = find_post_index(id)
+    if index is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f'Post with id {id} not found.',
+        )
+    # Update the post details
+    updated_post_dict = updated_post.model_dump()
+    updated_post_dict['id'] = id  # Ensure the ID remains unchanged
+    my_post[index].update(updated_post_dict)
+    return {
+        'message': f'Post with id {id} has been updated successfully.',
+        'updated_post': my_post[index],
     }
