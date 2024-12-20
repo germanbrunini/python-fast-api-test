@@ -1,14 +1,23 @@
-from fastapi import FastAPI, Response, HTTPException, status, Depends, Request
+from fastapi import (
+    APIRouter,
+    FastAPI,
+    Response,
+    HTTPException,
+    status,
+    Depends,
+    Request,
+)
 from random import randrange
 from typing import Annotated, List, Optional, Dict, Any, AsyncGenerator
 import psycopg
 from psycopg.rows import dict_row  # Import the row factory for dictionaries
-from psycopg_pool import AsyncConnectionPool
+from psycopg_pool import AsyncConnectionPool, PoolTimeout
 from pydantic import BaseModel, ValidationError, field_validator
 import time
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+
 
 # Detailed description of the API using Markdown
 
@@ -175,12 +184,50 @@ app = FastAPI(
 async def get_db_connection(
     request: Request,
 ) -> AsyncGenerator[psycopg.AsyncConnection[Any], None]:
-    # Ensure the `pool` attribute exists on `app.state`
+    """
+    Dependency that provides a database connection from the pool.
+    If the pool is at capacity, it will attempt to acquire a connection
+    multiple times before returning a 503 error.
+
+    Raises:
+        RuntimeError: If the database pool is not initialized on the app.
+        HTTPException(503): If the maximum retry attempts are exceeded and
+            no connection can be acquired from the pool.
+    """
+    # Check that the pool exists in the app state
     if not hasattr(request.app.state, 'pool'):
         raise RuntimeError('Database pool not initialized.')
 
-    async with request.app.state.pool.connection() as conn:
-        yield conn
+    max_retries = 3
+    retry_delay = 0.5  # seconds
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            # Attempt to acquire a connection from the pool
+            async with request.app.state.pool.connection() as conn:
+                # Successfully acquired a connection: yield it for the endpoint to use
+                yield conn
+                # After the yield, the connection is automatically released
+                return
+
+        except PoolTimeout:
+            # No connections available within the timeout
+            logger.warning(
+                'No available connections in the pool (attempt %d/%d). Retrying in %0.1f seconds...',
+                attempt,
+                max_retries,
+                retry_delay,
+            )
+
+            if attempt < max_retries:
+                # Wait before retrying
+                await asyncio.sleep(retry_delay)
+            else:
+                # Max retries reached; return a 503 error to the client
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail='The service is currently too busy. Please try again later.',
+                ) from None
 
 
 my_post = [
@@ -460,16 +507,14 @@ async def create_post(
     the newly created post with a `201 Created` status code.
 
     Args:
-        post_data (PostCreate): A Pydantic model instance containing the
-            following fields:
+        post_data (PostCreate): A Pydantic model instance containing:
             - title (str): The title of the post.
             - content (str): The body/content of the post.
-            - published (bool): Indicates whether the post is published or not.
-        conn (psycopg.AsyncConnection): An asynchronous database connection
-            provided by the application's connection pool.
+            - published (bool): Indicates whether the post is published.
+        conn (psycopg.AsyncConnection): A database connection from the pool.
 
     Returns:
-        Post: The newly created post, including its `id`, `title`, `content`,
+        Post: The newly created post with its `id`, `title`, `content`,
         and `published` status.
 
     Raises:
@@ -480,52 +525,44 @@ async def create_post(
         1. Launch Postman.
         2. Set the request method to POST.
         3. Enter the endpoint URL: http://127.0.0.1:8000/posts/
-        4. Go to the "Body" tab and select "raw" and "JSON".
-        5. In the request body, provide valid JSON data. For example:
+        4. In the Body (raw JSON):
            {
                "title": "My Awesome Post",
                "content": "This is the content of my awesome post.",
                "published": true
            }
-        6. Click "Send".
-        7. If successful, you will receive a `201 Created` response and a JSON
-           object representing the newly created post. For example:
-           {
-               "id": 42,
-               "title": "My Awesome Post",
-               "content": "This is the content of my awesome post.",
-               "published": true
-           }
+        5. Click "Send".
+        6. If successful, you receive a `201 Created` response with the new post's details.
     """
     try:
-        async with conn.cursor() as cur:
-            # Insert the new post into the database and return its full data.
-            # Using RETURNING clause to get the newly created post's columns.
-            await cur.execute(
-                """
-                INSERT INTO public.posts (title, content, published)
-                VALUES (%s, %s, %s)
-                RETURNING id, title, content, published;
-                """,
-                (post_data.title, post_data.content, post_data.published),
-            )
-            new_post_row = await cur.fetchone()
-
-            # If for some reason no row is returned (highly unlikely), raise an error.
-            if not new_post_row:
-                logger.error('No data returned after inserting a new post.')
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail='Failed to retrieve newly created post.',
+        # Use a transaction block. If any error occurs inside, changes are rolled back.
+        async with conn.transaction():
+            async with conn.cursor() as cur:
+                # Insert the new post and return it
+                await cur.execute(
+                    """
+                    INSERT INTO public.posts (title, content, published)
+                    VALUES (%s, %s, %s)
+                    RETURNING id, title, content, published;
+                    """,
+                    (post_data.title, post_data.content, post_data.published),
                 )
-            # Commit the transaction so that the insertion is persisted
-            await conn.commit()
-            # Convert the returned dictionary row into a Post model.
+                new_post_row = await cur.fetchone()
+
+                # If no row is returned, this indicates an unexpected error.
+                if not new_post_row:
+                    logger.error('No data returned after inserting a new post.')
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail='Failed to retrieve newly created post.',
+                    )
+
+            # If we reach here, the transaction completes successfully and commits automatically.
             new_post = Post(**new_post_row)
             return new_post
 
     except psycopg.OperationalError as oe:
-        # Handle common database operational issues, like connection interruptions.
+        # Database connection or operational issues
         logger.error(
             'Database operational error occurred while creating a post: %s', oe
         )
@@ -534,8 +571,12 @@ async def create_post(
             detail='Database is temporarily unavailable. Please try again later.',
         ) from oe
 
+    except HTTPException as he:
+        # Re-raise known HTTP exceptions so FastAPI can handle them
+        raise he
+
     except Exception as e:
-        # Catch-all for unexpected exceptions.
+        # Catch-all for unexpected exceptions
         logger.exception('Unexpected error occurred while creating a post: %s', e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -578,40 +619,36 @@ async def delete_post(
     Example (Testing with Postman):
         1. Launch Postman.
         2. Set the request method to DELETE.
-        3. Enter the endpoint URL: http://localhost:8000/posts/1
+        3. Enter the endpoint URL: http://127.0.0.1:8000/posts/1
         4. Click "Send".
         5. If successful, you will receive a `200 OK` response and a JSON object confirming deletion.
            If the post doesn't exist, you'll get a `404 Not Found` response.
     """
     try:
-        async with conn.cursor() as cur:
-            # Attempt to delete the post and return its data
-            # Using the RETURNING clause to retrieve the deleted post
-            await cur.execute(
-                """
-                DELETE FROM public.posts
-                WHERE id = %s
-                RETURNING id, title, content, published;
-                """,
-                (id,),
-            )
-            deleted_post_row = await cur.fetchone()
-
-            # If no row returned, the post doesn't exist
-            if not deleted_post_row:
-                logger.info('No post found with id %d. Cannot delete.', id)
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail=f'Post with id {id} not found.',
+        async with conn.transaction():
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    DELETE FROM public.posts
+                    WHERE id = %s
+                    RETURNING id, title, content, published;
+                    """,
+                    (id,),
                 )
+                deleted_post_row = await cur.fetchone()
 
-        # Commit the transaction to finalize the deletion
-        await conn.commit()
+                if not deleted_post_row:
+                    logger.info('No post found with id %d. Cannot delete.', id)
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail=f'Post with id {id} not found.',
+                    )
 
-        return {
-            'message': f'Post with id {id} has been deleted successfully.',
-            'deleted_post': deleted_post_row,
-        }
+            # Transaction commits automatically here if no exceptions are raised.
+            return {
+                'message': f'Post with id {id} has been deleted successfully.',
+                'deleted_post': deleted_post_row,
+            }
 
     except psycopg.OperationalError as oe:
         logger.error(
@@ -621,6 +658,10 @@ async def delete_post(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail='Database is temporarily unavailable. Please try again later.',
         ) from oe
+
+    except HTTPException as he:
+        # Re-raise known HTTP errors
+        raise he
 
     except Exception as e:
         logger.exception('Unexpected error occurred while deleting post %d: %s', id, e)
@@ -659,7 +700,7 @@ async def update_post(
     Example (Testing with Postman):
         1. Launch Postman.
         2. Set the request method to PUT.
-        3. Enter the endpoint URL: http://localhost:8000/posts/1
+        3. Enter the endpoint URL: http://127.0.0.1:8000/posts/1
         4. Go to the "Body" tab, select "raw" and "JSON".
         5. Provide a valid JSON body, for example:
            {
@@ -672,31 +713,33 @@ async def update_post(
            object representing the updated post.
     """
     try:
-        async with conn.cursor() as cur:
-            # Update the post and return the updated fields
-            await cur.execute(
-                """
-                UPDATE public.posts
-                SET title = %s, content = %s, published = %s
-                WHERE id = %s
-                RETURNING id, title, content, published;
-                """,
-                (updated_post.title, updated_post.content, updated_post.published, id),
-            )
-            updated_row = await cur.fetchone()
-
-            # If no row returned, the post doesn't exist
-            if not updated_row:
-                logger.info('No post found with id %d for update.', id)
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail=f'Post with id {id} not found.',
+        async with conn.transaction():
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    UPDATE public.posts
+                    SET title = %s, content = %s, published = %s
+                    WHERE id = %s
+                    RETURNING id, title, content, published;
+                    """,
+                    (
+                        updated_post.title,
+                        updated_post.content,
+                        updated_post.published,
+                        id,
+                    ),
                 )
+                updated_row = await cur.fetchone()
 
-        # Commit the transaction to persist changes
-        await conn.commit()
+                if not updated_row:
+                    logger.info('No post found with id %d for update.', id)
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail=f'Post with id {id} not found.',
+                    )
 
-        return Post(**updated_row)
+            # Transaction commits automatically here if no exceptions are raised.
+            return Post(**updated_row)
 
     except psycopg.OperationalError as oe:
         logger.error(
@@ -707,9 +750,59 @@ async def update_post(
             detail='Database is temporarily unavailable. Please try again later.',
         ) from oe
 
+    except HTTPException as he:
+        # Re-raise known HTTP exceptions
+        raise he
+
     except Exception as e:
         logger.exception('Unexpected error occurred while updating post %d: %s', id, e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail='An unexpected error occurred. Please contact support if the issue persists.',
         ) from e
+
+
+health_router = APIRouter()
+
+
+@health_router.get('/health', status_code=status.HTTP_200_OK)
+async def health_check(
+    conn: Annotated[psycopg.AsyncConnection, Depends(get_db_connection)],
+):
+    """
+    Health-check endpoint to verify database connectivity.
+
+    This endpoint executes a simple "SELECT 1" query to ensure that:
+    - The connection pool is operational.
+    - The database is reachable.
+
+    If the query succeeds, returns a 200 OK response with a simple JSON.
+    If it fails, returns a 503 Service Unavailable.
+    """
+    try:
+        async with conn.cursor() as cur:
+            await cur.execute('SELECT 1 AS health_check;')
+            result = await cur.fetchone()  # result should look like {"health_check": 1}
+
+            if result is None or result['health_check'] != 1:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail='Database health check query failed.',
+                )
+        return {'status': 'ok'}
+    except psycopg.OperationalError as oe:
+        # If we have a database operational error, the DB is likely unavailable.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f'Database unavailable: {oe}',
+        ) from None
+    except Exception as e:
+        # Catch-all for any unexpected errors.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f'Unexpected error during health check: {e}',
+        ) from None
+
+
+# Assuming health_router is defined elsewhere
+app.include_router(health_router)
